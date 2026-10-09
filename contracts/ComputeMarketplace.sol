@@ -11,19 +11,29 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///         and researchers rent machine time, paid in QBC.
 ///
 /// Lifecycle of a reservation:
-///   1. Renter calls `reserve` -> QBC is escrowed in this contract.
-///   2. Provider calls `complete` with a hash of the job results -> escrow is
-///      released to the provider, minus the protocol fee sent to the treasury.
-///   3. If the provider never completes before the deadline, the renter calls
-///      `refund` and gets the full escrow back. The provider can also
-///      `reject` a reservation at any time before completion to refund it.
+///   Pending    Renter called `reserve`; QBC is escrowed here.
+///              - provider `deliver`s before the deadline       -> Delivered
+///              - provider `reject`s                             -> Refunded
+///              - deadline passes, anyone calls `refund`         -> Refunded
+///   Delivered  Provider posted a result hash. A dispute window opens.
+///              - renter `accept`s                               -> Settled (provider paid)
+///              - window passes, anyone calls `finalize`         -> Settled (provider paid)
+///              - renter `dispute`s inside the window            -> Disputed
+///   Disputed   The arbiter `resolve`s with a provider/renter split -> Settled.
+///              If the arbiter does nothing for ARBITRATION_TIMEOUT,
+///              anyone can `settleStaleDispute` for a 50/50 split.
+///
+/// Fee and dispute window are snapshotted per reservation, so changing them
+/// never affects reservations already made.
 contract ComputeMarketplace is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     enum Status {
         None,
         Pending,
-        Completed,
+        Delivered,
+        Disputed,
+        Settled,
         Refunded
     }
 
@@ -40,18 +50,26 @@ contract ComputeMarketplace is Ownable, ReentrancyGuard {
         address renter;
         address provider;
         uint64 seconds_;
-        uint64 deadline;
-        uint256 amount;
+        uint64 deadline; // provider must deliver by this time
+        uint64 updatedAt; // time of the last status change
+        uint64 disputeWindow; // snapshot at reservation time
+        uint16 feeBps; // snapshot at reservation time
         Status status;
+        uint256 amount;
         bytes32 jobSpecHash; // hash of the circuit / job description
-        bytes32 resultHash; // hash of results, set on completion
+        bytes32 resultHash; // hash of results, set on delivery
     }
 
+    uint16 public constant BPS = 10_000;
     uint16 public constant MAX_FEE_BPS = 1_000; // 10%
+    uint64 public constant MAX_DISPUTE_WINDOW = 30 days;
+    uint64 public constant ARBITRATION_TIMEOUT = 30 days;
 
     IERC20 public immutable qbc;
     address public treasury;
+    address public arbiter;
     uint16 public feeBps;
+    uint64 public disputeWindow;
 
     uint256 public nextBackendId = 1;
     uint256 public nextReservationId = 1;
@@ -61,24 +79,42 @@ contract ComputeMarketplace is Ownable, ReentrancyGuard {
     event BackendRegistered(uint256 indexed id, address indexed provider, string name, uint32 qubits, uint256 pricePerSecond);
     event BackendUpdated(uint256 indexed id, uint256 pricePerSecond, bool active);
     event Reserved(uint256 indexed id, uint256 indexed backendId, address indexed renter, uint64 seconds_, uint256 amount, uint64 deadline, bytes32 jobSpecHash);
-    event Completed(uint256 indexed id, bytes32 resultHash, uint256 providerPayout, uint256 fee);
+    event Delivered(uint256 indexed id, bytes32 resultHash);
+    event Disputed(uint256 indexed id);
+    event Settled(uint256 indexed id, uint256 providerPayout, uint256 fee, uint256 renterRefund);
     event Refunded(uint256 indexed id, uint256 amount);
     event FeeUpdated(uint16 feeBps);
     event TreasuryUpdated(address treasury);
+    event ArbiterUpdated(address arbiter);
+    event DisputeWindowUpdated(uint64 disputeWindow);
 
     error NotProvider();
+    error NotRenter();
+    error NotArbiter();
     error BackendInactive();
     error InvalidParams();
     error BadStatus();
-    error DeadlineNotReached();
-    error DeadlinePassed();
+    error TooEarly();
+    error TooLate();
     error PriceChanged();
 
-    constructor(IERC20 qbc_, address owner_, address treasury_, uint16 feeBps_) Ownable(owner_) {
-        if (address(qbc_) == address(0) || treasury_ == address(0) || feeBps_ > MAX_FEE_BPS) revert InvalidParams();
+    constructor(
+        IERC20 qbc_,
+        address owner_,
+        address treasury_,
+        address arbiter_,
+        uint16 feeBps_,
+        uint64 disputeWindow_
+    ) Ownable(owner_) {
+        if (
+            address(qbc_) == address(0) || treasury_ == address(0) || arbiter_ == address(0) || feeBps_ > MAX_FEE_BPS
+                || disputeWindow_ == 0 || disputeWindow_ > MAX_DISPUTE_WINDOW
+        ) revert InvalidParams();
         qbc = qbc_;
         treasury = treasury_;
+        arbiter = arbiter_;
         feeBps = feeBps_;
+        disputeWindow = disputeWindow_;
     }
 
     // ---------------------------------------------------------------------
@@ -101,12 +137,33 @@ contract ComputeMarketplace is Ownable, ReentrancyGuard {
         emit BackendUpdated(id, pricePerSecond, active);
     }
 
+    /// @notice Provider posts the result hash for an executed job. Payment is
+    ///         released once the renter accepts or the dispute window passes.
+    function deliver(uint256 id, bytes32 resultHash) external {
+        Reservation storage r = reservations[id];
+        if (r.provider != msg.sender) revert NotProvider();
+        if (r.status != Status.Pending) revert BadStatus();
+        if (block.timestamp > r.deadline) revert TooLate();
+        if (resultHash == bytes32(0)) revert InvalidParams();
+        r.status = Status.Delivered;
+        r.resultHash = resultHash;
+        r.updatedAt = uint64(block.timestamp);
+        emit Delivered(id, resultHash);
+    }
+
+    /// @notice Provider declines a pending reservation; renter is fully refunded.
+    function reject(uint256 id) external nonReentrant {
+        Reservation storage r = reservations[id];
+        if (r.provider != msg.sender) revert NotProvider();
+        _refund(r, id);
+    }
+
     // ---------------------------------------------------------------------
     // Renters
     // ---------------------------------------------------------------------
 
     /// @param maxPricePerSecond guards against the provider front-running a price increase.
-    /// @param ttl seconds from now within which the provider must complete the job.
+    /// @param ttl seconds from now within which the provider must deliver.
     function reserve(
         uint256 backendId,
         uint64 seconds_,
@@ -129,8 +186,11 @@ contract ComputeMarketplace is Ownable, ReentrancyGuard {
             provider: b.provider,
             seconds_: seconds_,
             deadline: deadline,
-            amount: amount,
+            updatedAt: uint64(block.timestamp),
+            disputeWindow: disputeWindow,
+            feeBps: feeBps,
             status: Status.Pending,
+            amount: amount,
             jobSpecHash: jobSpecHash,
             resultHash: bytes32(0)
         });
@@ -139,40 +199,90 @@ contract ComputeMarketplace is Ownable, ReentrancyGuard {
         emit Reserved(id, backendId, msg.sender, seconds_, amount, deadline, jobSpecHash);
     }
 
-    /// @notice Provider marks the job as executed and gets paid.
-    function complete(uint256 id, bytes32 resultHash) external nonReentrant {
+    /// @notice Renter confirms the delivered results and releases payment early.
+    function accept(uint256 id) external nonReentrant {
         Reservation storage r = reservations[id];
-        if (r.provider != msg.sender) revert NotProvider();
-        if (r.status != Status.Pending) revert BadStatus();
-        if (block.timestamp > r.deadline) revert DeadlinePassed();
-
-        r.status = Status.Completed;
-        r.resultHash = resultHash;
-
-        uint256 fee = (r.amount * feeBps) / 10_000;
-        uint256 payout = r.amount - fee;
-        if (fee > 0) qbc.safeTransfer(treasury, fee);
-        qbc.safeTransfer(r.provider, payout);
-        emit Completed(id, resultHash, payout, fee);
+        if (r.renter != msg.sender) revert NotRenter();
+        if (r.status != Status.Delivered) revert BadStatus();
+        _settle(r, id, BPS);
     }
 
-    /// @notice Provider declines a reservation; renter is fully refunded.
-    function reject(uint256 id) external nonReentrant {
+    /// @notice Renter contests the delivered results within the dispute window.
+    function dispute(uint256 id) external {
         Reservation storage r = reservations[id];
-        if (r.provider != msg.sender) revert NotProvider();
-        _refund(r, id);
+        if (r.renter != msg.sender) revert NotRenter();
+        if (r.status != Status.Delivered) revert BadStatus();
+        if (block.timestamp > r.updatedAt + r.disputeWindow) revert TooLate();
+        r.status = Status.Disputed;
+        r.updatedAt = uint64(block.timestamp);
+        emit Disputed(id);
     }
 
-    /// @notice Anyone can trigger a refund to the renter once the deadline has passed unfulfilled.
+    // ---------------------------------------------------------------------
+    // Permissionless settlement
+    // ---------------------------------------------------------------------
+
+    /// @notice Pays the provider once the dispute window has passed undisputed.
+    function finalize(uint256 id) external nonReentrant {
+        Reservation storage r = reservations[id];
+        if (r.status != Status.Delivered) revert BadStatus();
+        if (block.timestamp <= r.updatedAt + r.disputeWindow) revert TooEarly();
+        _settle(r, id, BPS);
+    }
+
+    /// @notice Refunds the renter once the delivery deadline has passed undelivered.
     function refund(uint256 id) external nonReentrant {
         Reservation storage r = reservations[id];
-        if (block.timestamp <= r.deadline) revert DeadlineNotReached();
+        if (block.timestamp <= r.deadline) revert TooEarly();
         _refund(r, id);
+    }
+
+    /// @notice Splits a dispute 50/50 if the arbiter has not ruled in time,
+    ///         so escrow can never be locked forever.
+    function settleStaleDispute(uint256 id) external nonReentrant {
+        Reservation storage r = reservations[id];
+        if (r.status != Status.Disputed) revert BadStatus();
+        if (block.timestamp <= r.updatedAt + ARBITRATION_TIMEOUT) revert TooEarly();
+        _settle(r, id, BPS / 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // Arbiter
+    // ---------------------------------------------------------------------
+
+    /// @param providerBps share of the escrow paid to the provider (0..10000);
+    ///        the rest is refunded to the renter. Fee applies to the provider share only.
+    function resolve(uint256 id, uint16 providerBps) external nonReentrant {
+        if (msg.sender != arbiter) revert NotArbiter();
+        Reservation storage r = reservations[id];
+        if (r.status != Status.Disputed) revert BadStatus();
+        if (providerBps > BPS) revert InvalidParams();
+        _settle(r, id, providerBps);
+    }
+
+    // ---------------------------------------------------------------------
+    // Internal
+    // ---------------------------------------------------------------------
+
+    function _settle(Reservation storage r, uint256 id, uint256 providerBps) private {
+        r.status = Status.Settled;
+        r.updatedAt = uint64(block.timestamp);
+
+        uint256 providerGross = (r.amount * providerBps) / BPS;
+        uint256 renterRefund = r.amount - providerGross;
+        uint256 fee = (providerGross * r.feeBps) / BPS;
+        uint256 payout = providerGross - fee;
+
+        if (fee > 0) qbc.safeTransfer(treasury, fee);
+        if (payout > 0) qbc.safeTransfer(r.provider, payout);
+        if (renterRefund > 0) qbc.safeTransfer(r.renter, renterRefund);
+        emit Settled(id, payout, fee, renterRefund);
     }
 
     function _refund(Reservation storage r, uint256 id) private {
         if (r.status != Status.Pending) revert BadStatus();
         r.status = Status.Refunded;
+        r.updatedAt = uint64(block.timestamp);
         qbc.safeTransfer(r.renter, r.amount);
         emit Refunded(id, r.amount);
     }
@@ -191,5 +301,17 @@ contract ComputeMarketplace is Ownable, ReentrancyGuard {
         if (treasury_ == address(0)) revert InvalidParams();
         treasury = treasury_;
         emit TreasuryUpdated(treasury_);
+    }
+
+    function setArbiter(address arbiter_) external onlyOwner {
+        if (arbiter_ == address(0)) revert InvalidParams();
+        arbiter = arbiter_;
+        emit ArbiterUpdated(arbiter_);
+    }
+
+    function setDisputeWindow(uint64 disputeWindow_) external onlyOwner {
+        if (disputeWindow_ == 0 || disputeWindow_ > MAX_DISPUTE_WINDOW) revert InvalidParams();
+        disputeWindow = disputeWindow_;
+        emit DisputeWindowUpdated(disputeWindow_);
     }
 }
